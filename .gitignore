@@ -142,3 +142,4 @@ dmypy.json
 data_*
 ckpts
 configs
+sac_ra_act_logs
