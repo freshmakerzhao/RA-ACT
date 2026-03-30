@@ -141,7 +141,7 @@ def sample_box_pose():
     cube_quat = np.array([1, 0, 0, 0])
     return np.concatenate([cube_position, cube_quat])
 
-
+# x=[-0.2, 0.0], y=[0.4, 0.6]
 def sample_box_pose_eval():
     x_range = [0.0, 0.2]
     y_range = [0.4, 0.6]

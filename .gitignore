@@ -141,3 +141,4 @@ dmypy.json
 
 data_*
 ckpts
+configs
