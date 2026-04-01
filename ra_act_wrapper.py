@@ -62,35 +62,55 @@ class RA_ACT_Wrapper(gym.Env):
         return self._get_rl_obs(self._last_ts.observation, a_nom)
 
     def step(self, residual_action):
-        # 1. 检查是否需要更新 Chunk
         if self.step_count % self.query_freq == 0 and self.step_count > 0:
             self.current_chunk = self._query_act(self._last_ts.observation)
             
-        # 2. 提取当前步骤的名义动作
         chunk_index = self.step_count % self.query_freq
         a_nom = self.current_chunk[chunk_index]
         
-        # 3. 动作融合 (残差映射到 [-epsilon, epsilon])
-        delta_a = np.tanh(residual_action) * self.epsilon # 这里目前给到的是0,没有影响act的输出
-        a_env = a_nom + delta_a # 拿到最终动作 = ACT 输出 + RL 给的残差，当前 residual_action 是全 0 的，所以 a_env 就完全等于 a_nom
+        # 1. 残差映射
+        delta_a = np.tanh(residual_action) * self.epsilon
         
-        # 4. 执行物理仿真
+        # ================= [屏蔽夹爪的残差干预] =================
+        # 不让 RL 动夹爪，把夹爪的纠偏量强制设为 0
+        delta_a[-1] = 0.0
+        # ================================================================
+        
+        a_env = a_nom + delta_a
+        
+        # 物理执行
         self._last_ts = self.env.step(a_env)
         
-        # 5. 获取下一步给 RL 的观测
         next_chunk_idx = (self.step_count + 1) % self.query_freq
         next_a_nom = self.current_chunk[next_chunk_idx] if next_chunk_idx != 0 else a_nom
         rl_obs = self._get_rl_obs(self._last_ts.observation, next_a_nom)
         
-        # 6. 计算 Reward (这里暂时只透传原环境 reward，供 Dummy Test 使用)
-        base_reward = self._last_ts.reward if self._last_ts.reward is not None else 0.0
-        penalty = self.lambda_penalty * np.linalg.norm(delta_a)**2
-        rl_reward = base_reward - penalty
-        
         done = self._last_ts.last()
         self.step_count += 1
         
-        info = {'base_reward': base_reward, 'penalty': penalty}
+        # ================= [关键修复 2：防止骗分] =================
+        base_reward = self._last_ts.reward if self._last_ts.reward is not None else 0.0
+        
+        # 重新定义 task_reward：
+        # 原环境 reward: 1(碰到), 2(抓起), 3(抓着碰到托盘), 4(放下)
+        if base_reward < 2.0:
+            task_reward = 0.0     # 仅仅碰到方块 (1分)
+        elif base_reward < 4.0:
+            task_reward = 100.0   # 真正抓离了桌面 (2分或3分)，给 100 分奖励
+        else:
+            task_reward = 200.0   # 完美完成 (4分)，给 200 分
+            
+        # 动作平滑惩罚
+        action_penalty = self.lambda_penalty * np.linalg.norm(delta_a)**2
+        
+        rl_reward = task_reward - action_penalty
+        # ================================================================
+
+        info = {
+            'base_reward': base_reward,
+            'dist': 0.0,
+            'penalty': action_penalty
+        }
         return rl_obs, rl_reward, done, info
 
     @torch.inference_mode()

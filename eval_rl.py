@@ -1,32 +1,28 @@
 import os
 import torch
 import pickle
+import numpy as np
 from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 
-# 导入你自己的代码
 from constants import load_config, get_training_config, get_equipment_model, get_sim_task_config
 from sim_env import make_sim_env
 from policy import ACTPolicy
 from ra_act_wrapper import RA_ACT_Wrapper
 
-def train_residual_sac():
-    # ================= 1. 初始化和加载预备环境 =================
+def evaluate_rl_success_rate():
     config_path = "configs/fairino5_single_act_base/03_eval.yaml" 
     yaml_config = load_config(config_path)
     training_config = get_training_config(config_path)
     
     task_name = yaml_config.get('task', {}).get('name', 'sim_lifting_cube_scripted')
     equipment_model = get_equipment_model(config_path)
-    ckpt_dir = training_config.get('ckpt_dir', './ckpts/fairino5_single_act_base')
+    ckpt_dir = training_config.get('ckpt_dir', './ckpts')
     task_config = get_sim_task_config(task_name, config_path)
     camera_names = task_config['camera_names']
     
-    # 加载 stats
     with open(os.path.join(ckpt_dir, 'dataset_stats.pkl'), 'rb') as f:
         stats = pickle.load(f)
 
-    # 加载预训练的 ACT
     policy_config = {
         'num_queries': training_config.get('chunk_size', 100),
         'kl_weight': training_config.get('kl_weight', 10),
@@ -40,50 +36,42 @@ def train_residual_sac():
     act_policy.cuda()
     act_policy.eval()
 
-    # ================= 2. 包装强化学习环境 =================
     base_env = make_sim_env(task_name, equipment_model)
     wrapper_config = {
+        'task_name': task_name,
+        'equipment_model': equipment_model,
         'camera_names': camera_names,
         'policy_config': policy_config,
-        'state_dim': 7
+        'state_dim': 14 if 'bimanual' in equipment_model else (4 if 'excavator' in equipment_model else 7)
     }
-    
-    # Wrapper
-    # epsilon 控制残差的最大修正幅度，如果是弧度制，0.05~0.1 左右比较安全
     rl_env = RA_ACT_Wrapper(base_env, act_policy, stats, wrapper_config, epsilon=0.08)
 
-    # ================= 3. 定义 SAC 算法模型 =================
-    log_dir = "./sac_ra_act_logs/"
-    os.makedirs(log_dir, exist_ok=True)
-    
-    # 采用 MLP 网络 (因为我们给 RL 的状态是拼接好的一维向量)
-    model = SAC(
-        "MlpPolicy", 
-        rl_env, 
-        learning_rate=3e-4, 
-        buffer_size=100000, 
-        batch_size=256,
-        ent_coef='auto', # 自动调节温度参数以鼓励探索
-        gamma=0.99,      # 折扣因子
-        tensorboard_log=log_dir,
-        verbose=1,
-        device="cuda"
-    )
+    model_path = "./sac_ra_act_logs/ra_act_sac_final" 
+    model = SAC.load(model_path)
 
-    # 回调函数：每 10000 步保存一次模型
-    checkpoint_callback = CheckpointCallback(
-        save_freq=10000, 
-        save_path=log_dir, 
-        name_prefix="ra_act_sac_model"
-    )
-
-    print("🚀 开始在 OOD 区域训练残差网络！")
-    # 开始训练，你可以先跑 100,000 步试试水，大概十几分钟就能看到收敛趋势
-    model.learn(total_timesteps=100000, callback=checkpoint_callback)
+    num_rollouts = 50
+    success_count = 0
+    max_timesteps = 400
     
-    # 保存最终模型
-    model.save(os.path.join(log_dir, "ra_act_sac_final"))
-    print("✅ 训练完成，模型已保存！")
+    print("🚀 开始在 OOD 区域进行批量评估 (50次)...")
+    for i in range(num_rollouts):
+        obs = rl_env.reset()
+        max_reward_in_ep = 0
+        
+        for t in range(max_timesteps):
+            action, _states = model.predict(obs, deterministic=True)
+            obs, reward, done, info = rl_env.step(action)
+            max_reward_in_ep = max(max_reward_in_ep, info['base_reward'])
+            if done:
+                break
+                
+        if max_reward_in_ep == base_env.task.max_reward:
+            success_count += 1
+            print(f"Rollout {i}: 成功")
+        else:
+            print(f"Rollout {i}: 失败 (Max Reward: {max_reward_in_ep})")
+            
+    print(f"\n✅ 结合残差 RL 后的 OOD 测试成功率: {success_count}/{num_rollouts} = {success_count/num_rollouts*100}%")
 
 if __name__ == '__main__':
-    train_residual_sac()
+    evaluate_rl_success_rate()
